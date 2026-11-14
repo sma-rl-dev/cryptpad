@@ -1,0 +1,341 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# CryptPad - Tester Environment CLI
+# Usage: ./tester-env <command> [--run-id <id>] [--port <port>]
+# Commands: deploy, seed, verify, reset, stop, logs, status
+#
+# Dual-origin note: CryptPad serves the main app and a CSP sandbox on two
+# different origins. Locally the sandbox is emulated on a second port:
+#   main    = PORT        (container listens on PORT, published as PORT:PORT)
+#   sandbox = PORT+1      (container listens on PORT+1, published as PORT+1:PORT+1)
+#   websocket internal = PORT+2 (proxied via /cryptpad_websocket, not published)
+# Same-number host:container mapping keeps the derived sandbox origin correct.
+# OnlyOffice is never installed (CPAD_INSTALL_ONLYOFFICE unset).
+#
+# Origin note: CryptPad gates app paths CLIENT-SIDE on window.location.origin
+# === ApiConfig.httpUnsafeOrigin (www/common/sframe-common-outer.js). The
+# tester's browser runs inside a container where localhost=self, so the app must
+# advertise the origin that browser actually navigates to:
+#   - scripts/rl-env exports TESTER_ENV_BROWSER_ORIGIN (the bridge gateway, e.g.
+#     http://172.17.0.1:8240), matching ts-runner's browser URL;
+#   - manual runs (browser-checker via the shared MCP browser) reach the host as
+#     host.docker.internal, so that is the fallback when the var is unset.
+# httpUnsafeOrigin is pinned to BROWSER_ORIGIN; httpSafeOrigin is derived by
+# upstream lib/env.js as unsafe+1 port. Host-side curl to
+# http://localhost:<port>/ still works (no server-side Host-header gate).
+
+RUN_ID="default"
+PORT="${PORT:-8240}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TESTER_ENV_PROJECT="${TESTER_ENV_PROJECT:-tester-env}"
+TESTER_ENV_APP="${TESTER_ENV_APP:-cryptpad}"
+TESTER_ENV_SCENARIO="${TESTER_ENV_SCENARIO:-manual}"
+
+refresh_names() {
+    local suffix=""
+    if [[ "${RUN_ID}" != "default" ]]; then
+        suffix="-${RUN_ID}"
+    fi
+    CONTAINER_NAME="tester-env-cryptpad${suffix}"
+    # IMAGE_TAG set by scripts/rl-env to a content-addressed tag so identical
+    # (baseline, patch-set) combos share an image. Manual invocations get :dev.
+    IMAGE_NAME="${IMAGE_TAG:-tester-env-cryptpad:dev}"
+    MAIN_PORT="${PORT}"
+    SANDBOX_PORT="$((PORT + 1))"
+    WS_PORT="$((PORT + 2))"
+    VOL_PREFIX="cryptpad${suffix}"
+    # Browser-visible main origin (see header). Trailing slash normalised away.
+    local explicit="${TESTER_ENV_BROWSER_ORIGIN:-}"
+    if [[ -n "${explicit}" ]]; then
+        if [[ ! "${explicit}" =~ ^[a-z][a-z0-9+.-]*://[^/:]+:[0-9]+/?$ ]]; then
+            echo "ERROR: TESTER_ENV_BROWSER_ORIGIN must be scheme://host:port (got '${explicit}')" >&2
+            exit 1
+        fi
+        BROWSER_ORIGIN="${explicit%/}"
+    else
+        BROWSER_ORIGIN="http://host.docker.internal:${MAIN_PORT}"
+    fi
+    SANDBOX_ORIGIN="${BROWSER_ORIGIN%:*}:${SANDBOX_PORT}"
+}
+
+docker_labels() {
+    echo "--label" "tester-env.project=${TESTER_ENV_PROJECT}" \
+         "--label" "tester-env.app=${TESTER_ENV_APP}" \
+         "--label" "tester-env.scenario=${TESTER_ENV_SCENARIO}" \
+         "--label" "tester-env.run_id=${TESTER_ENV_RUN_ID:-${RUN_ID}}"
+}
+
+cmd_deploy() {
+    echo "==> Building Docker image ${IMAGE_NAME} from editable source..."
+    # shellcheck disable=SC2046
+    docker build \
+        $(docker_labels) \
+        -f "${SCRIPT_DIR}/Dockerfile.tester-env" \
+        -t "${IMAGE_NAME}" \
+        "${SCRIPT_DIR}"
+    cmd_reset
+    echo "==> Creating data volumes..."
+    # shellcheck disable=SC2046
+    for vol in blob block customize data datastore; do
+        docker volume create $(docker_labels) "${VOL_PREFIX}-${vol}" >/dev/null
+    done
+    echo "==> Starting CryptPad (browser origin ${BROWSER_ORIGIN}; sandbox ${SANDBOX_ORIGIN}; host equivalent http://localhost:${MAIN_PORT})..."
+    echo "    NOTE: first boot runs 'npm run build' (several minutes) before the server answers."
+    # shellcheck disable=SC2046
+    docker run -d --name "${CONTAINER_NAME}" \
+        $(docker_labels) \
+        -p "${MAIN_PORT}:${MAIN_PORT}" \
+        -p "${SANDBOX_PORT}:${SANDBOX_PORT}" \
+        -v "${VOL_PREFIX}-blob:/cryptpad/blob" \
+        -v "${VOL_PREFIX}-block:/cryptpad/block" \
+        -v "${VOL_PREFIX}-customize:/cryptpad/customize" \
+        -v "${VOL_PREFIX}-data:/cryptpad/data" \
+        -v "${VOL_PREFIX}-datastore:/cryptpad/datastore" \
+        -e "CPAD_MAIN_ORIGIN=${BROWSER_ORIGIN}" \
+        -e "CPAD_MAIN_PORT=${MAIN_PORT}" \
+        -e "CPAD_SANDBOX_PORT=${SANDBOX_PORT}" \
+        -e "CPAD_WS_PORT=${WS_PORT}" \
+        "${IMAGE_NAME}"
+    echo "==> Waiting for server to answer (up to 10 min for first-boot build)..."
+    for _ in $(seq 1 100); do
+        if curl -sf "http://localhost:${MAIN_PORT}/" >/dev/null 2>&1; then
+            echo "==> Deployment complete. App running at ${BROWSER_ORIGIN}/ (host: http://localhost:${MAIN_PORT}/)"
+            return 0
+        fi
+        sleep 6
+    done
+    echo "ERROR: server did not answer at http://localhost:${MAIN_PORT}/ after ~10 min"
+    docker logs --tail 30 "${CONTAINER_NAME}" || true
+    exit 1
+}
+
+cmd_seed() {
+    # Deterministic headless seed: fixed account rl-tester + 3 docs + folder Notes.
+    # Reproduces the browser registration flow inside the container (localhost net):
+    # scrypt-derived account keys, WRITE_BLOCK login block, pad channels with
+    # fixed content, account drive user-object. See scripts/tester-env-seed.cjs.
+    # Idempotent: exits 0 when the account channel is already populated.
+    # CPAD_MAIN_PORT keeps the seed's websocket URL aligned with the allocated
+    # run port. The seed uses container loopback, not the browser origin.
+    echo "==> Seeding CryptPad (fixed account rl-tester + 3 docs)..."
+    docker cp "${SCRIPT_DIR}/scripts/tester-env-seed.cjs" "${CONTAINER_NAME}:/tmp/tester-env-seed.cjs"
+    if docker exec -e "CPAD_MAIN_PORT=${MAIN_PORT}" \
+            "${CONTAINER_NAME}" node /tmp/tester-env-seed.cjs; then
+        echo "==> Seed complete. Login: rl-tester / Test-Password-RL-2026-Seed!"
+    else
+        local rc=$?
+        if [[ "${rc}" -eq 3 ]]; then
+            echo "==> Seed already populated (idempotent no-op)."
+            return 0
+        fi
+        echo "ERROR: seed failed (exit ${rc})"
+        return "${rc}"
+    fi
+}
+
+cmd_seed_verify() {
+    # Server-observable seed verification: reopen account + pads fresh, assert
+    # fixed names/content. Browser visibility (drive listing, doc rendering)
+    # must be confirmed by browser-checker; see cmd_help.
+    echo "==> Verifying CryptPad seed state..."
+    docker cp "${SCRIPT_DIR}/scripts/tester-env-seed.cjs" "${CONTAINER_NAME}:/tmp/tester-env-seed.cjs"
+    docker exec -e "CPAD_MAIN_PORT=${MAIN_PORT}" \
+        "${CONTAINER_NAME}" node /tmp/tester-env-seed.cjs --verify
+}
+
+cmd_verify() {
+    echo "==> Verifying CryptPad deployment..."
+    # Canonical origins use host.docker.internal (browser-checker's vantage).
+    # host.docker.internal may not resolve on the host, so probe the localhost
+    # equivalent (same server; no Host-header gating server-side).
+    local main="http://localhost:${MAIN_PORT}"
+    local sandbox="http://localhost:${SANDBOX_PORT}"
+    local expect_main="${BROWSER_ORIGIN}"
+    local expect_sandbox="${SANDBOX_ORIGIN}"
+    local fail=0
+    if curl -sf "${main}/" | grep -qi "cryptpad"; then
+        echo "  [ok] main page serves CryptPad at ${main}/"
+    else
+        echo "  [FAIL] main page does not serve CryptPad at ${main}/"
+        fail=1
+    fi
+    if curl -sf "${main}/api/config" | grep -q "${expect_sandbox}"; then
+        echo "  [ok] /api/config advertises sandbox origin ${expect_sandbox}"
+    else
+        echo "  [FAIL] /api/config does not advertise sandbox origin ${expect_sandbox}"
+        fail=1
+    fi
+    if curl -sf "${main}/api/config" | grep -q "${expect_main}"; then
+        echo "  [ok] /api/config advertises unsafe origin ${expect_main}"
+    else
+        echo "  [FAIL] /api/config does not advertise unsafe origin ${expect_main}"
+        fail=1
+    fi
+    if curl -sf "${sandbox}/" >/dev/null; then
+        echo "  [ok] sandbox origin answers at ${sandbox}/"
+    else
+        echo "  [FAIL] sandbox origin does not answer at ${sandbox}/"
+        fail=1
+    fi
+    if curl -sf "${main}/api/broadcast" >/dev/null; then
+        echo "  [ok] /api/broadcast answers"
+    else
+        echo "  [FAIL] /api/broadcast does not answer"
+        fail=1
+    fi
+    if [[ "${fail}" -ne 0 ]]; then
+        echo "==> Verification FAILED."
+        return 1
+    fi
+    cmd_seed_verify || return 1
+    echo "==> Verification complete."
+}
+
+cmd_reset() {
+    echo "==> Resetting environment..."
+    docker stop "${CONTAINER_NAME}" 2>/dev/null || true
+    docker rm "${CONTAINER_NAME}" 2>/dev/null || true
+    for vol in blob block customize data datastore; do
+        docker volume rm "${VOL_PREFIX}-${vol}" 2>/dev/null || true
+    done
+    echo "==> Reset complete. Run 'deploy' to start fresh."
+}
+
+cmd_stop() {
+    echo "==> Stopping container..."
+    docker stop "${CONTAINER_NAME}" 2>/dev/null || true
+    echo "==> Stopped."
+}
+
+cmd_logs() {
+    docker logs -f "${CONTAINER_NAME}" 2>/dev/null || echo "Container not running."
+}
+
+cmd_status() {
+    if docker ps --filter "name=${CONTAINER_NAME}" --format "{{.Names}}" | grep -q "${CONTAINER_NAME}"; then
+        echo "Status: RUNNING"
+        echo "URL (tester browser): ${BROWSER_ORIGIN}/"
+        echo "URL (host): http://localhost:${MAIN_PORT}/"
+        echo "Sandbox (tester browser): ${SANDBOX_ORIGIN}/"
+        echo "Sandbox (host): http://localhost:${SANDBOX_PORT}/"
+        echo "Container: ${CONTAINER_NAME}"
+    else
+        echo "Status: NOT RUNNING"
+    fi
+}
+
+cmd_help() {
+    cat <<EOF
+CryptPad - Tester Environment CLI
+
+Usage: ./tester-env <command> [--run-id <id>] [--port <port>]
+
+Commands:
+  deploy    Build image from source, start container (main=PORT, sandbox=PORT+1)
+  seed      Deterministic seed: fixed account rl-tester + 3 docs + folder Notes
+  verify    Assert main page, sandbox origin, API endpoints, AND seed state
+  reset     Stop container, remove container and data volumes (not the image)
+  stop      Stop container (preserves data)
+  logs      Tail container logs
+  status    Show container status
+
+Options:
+  --run-id <id>     Isolate container and volume names for parallel runs.
+                    Default: default
+  --port <port>     Host port for the main origin; sandbox uses port+1,
+                    websocket uses port+2 internally. Default: 8240
+
+Environment:
+  TESTER_ENV_BROWSER_ORIGIN  Browser-visible main origin (scheme://host:port),
+                    exported by scripts/rl-env (bridge gateway). Defaults to
+                    http://host.docker.internal:<port> for manual/MCP-browser
+                    runs. CryptPad pins ApiConfig.httpUnsafeOrigin to it.
+  IMAGE_TAG         Content-addressed image tag from scripts/rl-env; manual
+                    runs use tester-env-cryptpad:dev.
+  PORT              Same as --port (rl-env sets it).
+
+Typical workflow:
+  ./tester-env deploy              # Deploy baseline (tag 2026.5.1)
+  ./tester-env seed                # Seed fixed account + docs (deterministic)
+  ./tester-env verify              # Check server answers + seed state green
+  ./tester-env reset               # Clean slate
+
+Credentials: rl-tester / Test-Password-RL-2026-Seed! (fixed deterministic
+account created by ./tester-env seed; keys are scrypt-derived in-browser on
+login, localStorage holds User_hash/Block_hash/User_name for the session).
+Seeded drive: Q2 Launch Plan (Code, root), folder Notes containing
+Team Standup Notes + Shared Links (Code/Markdown).
+
+Browser visibility (for browser-checker, not asserted by verify):
+  - ${BROWSER_ORIGIN}/login/ with rl-tester + password
+    -> /drive/ shows All files with Q2 Launch Plan, folder Notes
+  - open Notes -> Team Standup Notes (contains 'Alice: API done'),
+    Shared Links (contains 'https://cryptpad.org')
+  - Q2 Launch Plan doc contains 'Goals: ship v2, onboard 5 beta users.'
+EOF
+}
+
+main() {
+    local cmd="${1:-help}"
+
+    for ((i=2; i<=$#; i++)); do
+        local arg="${!i}"
+        case "${arg}" in
+            --run-id)
+                local next=$((i+1))
+                if [[ ${next} -le $# ]]; then
+                    RUN_ID="${!next}"
+                    ((i++))
+                else
+                    echo "Error: --run-id requires a value"
+                    exit 1
+                fi
+                ;;
+            --port)
+                local next=$((i+1))
+                if [[ ${next} -le $# ]]; then
+                    PORT="${!next}"
+                    ((i++))
+                else
+                    echo "Error: --port requires a value"
+                    exit 1
+                fi
+                ;;
+            --ref)
+                echo "Note: --ref ignored; prospect checkout is managed by the orchestrator."
+                local next=$((i+1))
+                if [[ ${next} -le $# ]]; then ((i++)); fi
+                ;;
+            --help|-h)
+                cmd_help
+                exit 0
+                ;;
+            *)
+                echo "Unknown option: ${arg}"
+                cmd_help
+                exit 1
+                ;;
+        esac
+    done
+
+    refresh_names
+
+    case "${cmd}" in
+        deploy) cmd_deploy ;;
+        seed) cmd_seed ;;
+        verify) cmd_verify ;;
+        reset) cmd_reset ;;
+        stop) cmd_stop ;;
+        logs) cmd_logs ;;
+        status) cmd_status ;;
+        help|--help|-h) cmd_help ;;
+        *)
+            echo "Unknown command: ${cmd}"
+            cmd_help
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"
